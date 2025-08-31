@@ -9,7 +9,7 @@ import ruptures as rpt
 app = FastAPI()
 
 TARGET_LEN_SEC = 3.0   # 預期每段約 3s
-MIN_LEN_SEC    = 3.0   # 最短段長 3s（避免過碎）
+MIN_LEN_SEC    = 2.0   # 最短段長 3s（避免過碎）
 
 @app.post("/")
 async def ingest(req: Request):
