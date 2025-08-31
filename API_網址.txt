@@ -1,0 +1,6 @@
+瀏覽器 : 
+https://vercel.com/plus168109-1506s-projects/wave-cut
+
+
+請求發送測試 : 
+curl -X POST "https://wave-cut-six.vercel.app/api/ingest" -H "Content-Type: application/json" -d "{\"values\":[1,2,3,4,5]}"
