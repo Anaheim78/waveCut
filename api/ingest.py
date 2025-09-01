@@ -127,7 +127,7 @@ def analyze_arrays(t: np.ndarray, r: np.ndarray):
     k = max(1, int(round(box_win_sec * fs)))
     r_ma = _moving_average(r, k)
 
-    tau = 0.20
+    tau = 0.35
     alpha = dt / (tau + dt)
     r_s = _exp_smooth(r_ma, alpha)
 
