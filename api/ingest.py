@@ -1,5 +1,5 @@
 # api/ingest.py
-# FastAPI — 改进版嘟嘴检测：更合理的阈值策略 + 简化段落处理 + 直观计数
+# FastAPI — 原始robust算法 + 双向检测 + 修正计数逻辑
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import io, csv, math
@@ -8,235 +8,348 @@ import pandas as pd
 
 app = FastAPI()
 
-# ===== 改进版核心参数 =====
-class DetectionConfig:
-    # 信号预处理
-    SMOOTH_WINDOW_SEC = 0.1      # 移动平均窗口
-    EXP_SMOOTH_ALPHA = 0.3       # 指数平滑系数
-    
-    # 阈值策略
-    BASELINE_PERCENTILE = 30     # 基线百分位数
-    ACTIVATION_PERCENTILE = 75   # 激活百分位数
-    NOISE_MULTIPLIER = 2.5       # 噪声倍数
-    HYSTERESIS_RATIO = 0.7       # 回滞比例
-    
-    # 段落处理
-    MIN_POUT_DURATION = 0.3      # 最小嘟嘴持续时间(秒)
-    MAX_GAP_MERGE = 0.5          # 最大合并间隔(秒)
-    PADDING_SEC = 0.1            # 段落边缘扩展(秒)
+# ===== 原始robust算法核心 =====
+class RobustDetector:
+    @staticmethod
+    def _mad_sigma(x: np.ndarray) -> float:
+        """使用MAD估算robust标准差"""
+        med = np.median(x)
+        mad = np.median(np.abs(x - med))
+        return 1.4826 * mad
 
-# ===== 核心工具函数 =====
-def _estimate_fs(t: np.ndarray) -> float:
-    """估算采样率"""
-    if len(t) < 2:
-        return 20.0
-    dt = float(np.median(np.diff(t)))
-    return 1.0 / dt if dt > 1e-9 else 20.0
+    @staticmethod
+    def _estimate_fs(t: np.ndarray) -> float:
+        """估算采样率"""
+        if len(t) < 2: 
+            return 20.0
+        dt = float(np.median(np.diff(t)))
+        return 1.0 / dt if dt > 1e-9 else 20.0
 
-def _moving_average(x: np.ndarray, window_size: int) -> np.ndarray:
-    """移动平均滤波"""
-    if window_size <= 1:
-        return x.copy()
-    kernel = np.ones(int(window_size), dtype=float) / float(window_size)
-    return np.convolve(x, kernel, mode="same")
+    @staticmethod
+    def _moving_average(x: np.ndarray, k: int) -> np.ndarray:
+        """移动平均滤波"""
+        if k <= 1: 
+            return x.copy()
+        ker = np.ones(int(k), dtype=float) / float(k)
+        return np.convolve(x, ker, mode="same")
 
-def _exp_smooth(x: np.ndarray, alpha: float) -> np.ndarray:
-    """指数平滑滤波"""
-    if alpha <= 0:
-        return x.copy()
-    result = np.zeros_like(x, dtype=float)
-    result[0] = x[0]
-    for i in range(1, len(x)):
-        result[i] = alpha * x[i] + (1 - alpha) * result[i-1]
-    return result
+    @staticmethod
+    def _exp_smooth(x: np.ndarray, alpha: float) -> np.ndarray:
+        """指数平滑滤波"""
+        if alpha <= 0: 
+            return x.copy()
+        y = np.empty_like(x, dtype=float)
+        y[0] = x[0]
+        for i in range(1, len(x)):
+            y[i] = (1 - alpha) * y[i-1] + alpha * x[i]
+        return y
 
-def _preprocess_signal(signal: np.ndarray, fs: float) -> np.ndarray:
-    """信号预处理：移动平均 + 指数平滑"""
-    # 移动平均去噪
-    window_size = max(1, int(DetectionConfig.SMOOTH_WINDOW_SEC * fs))
-    smoothed = _moving_average(signal, window_size)
-    
-    # 指数平滑稳定信号
-    processed = _exp_smooth(smoothed, DetectionConfig.EXP_SMOOTH_ALPHA)
-    return processed
-
-def _calculate_adaptive_thresholds(signal: np.ndarray) -> dict:
-    """计算自适应阈值"""
-    # 计算基线和激活水平
-    baseline = np.percentile(signal, DetectionConfig.BASELINE_PERCENTILE)
-    activation = np.percentile(signal, DetectionConfig.ACTIVATION_PERCENTILE)
-    
-    # 估算噪声水平 (MAD方法)
-    median_val = np.median(signal)
-    mad = np.median(np.abs(signal - median_val))
-    noise_std = 1.4826 * mad  # MAD到标准差转换
-    
-    # 动态阈值计算
-    signal_range = activation - baseline
-    if signal_range > DetectionConfig.NOISE_MULTIPLIER * noise_std:
-        # 信号足够强，使用百分位数阈值
-        high_thresh = baseline + 0.6 * signal_range
-    else:
-        # 信号较弱，使用噪声基础阈值
-        high_thresh = baseline + DetectionConfig.NOISE_MULTIPLIER * noise_std
-    
-    # 回滞阈值
-    low_thresh = baseline + DetectionConfig.HYSTERESIS_RATIO * (high_thresh - baseline)
-    
-    return {
-        'high_threshold': high_thresh,
-        'low_threshold': low_thresh,
-        'baseline': baseline,
-        'noise_std': noise_std
-    }
-
-def _detect_pout_segments(signal: np.ndarray, thresholds: dict) -> list:
-    """使用回滞检测嘟嘴段落"""
-    high_thresh = thresholds['high_threshold']
-    low_thresh = thresholds['low_threshold']
-    
-    segments = []
-    in_pout = False
-    start_idx = 0
-    
-    for i, value in enumerate(signal):
-        if not in_pout:
-            # 寻找嘟嘴开始
-            if value >= high_thresh:
-                in_pout = True
-                start_idx = i
-        else:
-            # 寻找嘟嘴结束
-            if value < low_thresh:
-                segments.append((start_idx, i))
-                in_pout = False
-    
-    # 处理结尾仍在嘟嘴状态
-    if in_pout:
-        segments.append((start_idx, len(signal) - 1))
-    
-    return segments
-
-def _merge_close_segments(segments: list, timestamps: np.ndarray, max_gap_sec: float) -> list:
-    """合并相近的段落"""
-    if len(segments) < 2:
-        return segments
-    
-    merged = []
-    current_start, current_end = segments[0]
-    
-    for start, end in segments[1:]:
-        gap_time = timestamps[start] - timestamps[current_end]
+    @staticmethod
+    def _hysteresis_segments(y: np.ndarray, th_hi: float, th_lo: float, detect_high=True):
+        """双向回滞检测"""
+        segs, on, s, n = [], False, None, len(y)
         
-        if gap_time <= max_gap_sec:
-            # 合并段落
-            current_end = end
-        else:
-            # 保存当前段落，开始新段落
-            merged.append((current_start, current_end))
-            current_start, current_end = start, end
-    
-    # 添加最后一个段落
-    merged.append((current_start, current_end))
-    return merged
-
-def _filter_by_duration(segments: list, timestamps: np.ndarray, min_duration_sec: float) -> list:
-    """过滤太短的段落"""
-    filtered = []
-    for start, end in segments:
-        duration = timestamps[end] - timestamps[start]
-        if duration >= min_duration_sec:
-            filtered.append((start, end))
-    return filtered
-
-def _apply_padding(segments: list, signal_length: int, fs: float, padding_sec: float) -> list:
-    """为段落添加边缘扩展"""
-    padding_samples = int(padding_sec * fs)
-    padded = []
-    
-    for start, end in segments:
-        new_start = max(0, start - padding_samples)
-        new_end = min(signal_length - 1, end + padding_samples)
-        padded.append((new_start, new_end))
-    
-    return padded
-
-def _segments_to_results(segments: list, timestamps: np.ndarray) -> list:
-    """将段落索引转换为结果格式"""
-    results = []
-    for i, (start, end) in enumerate(segments):
-        start_time = timestamps[start]
-        end_time = timestamps[end]
-        duration = end_time - start_time
+        for i in range(n):
+            if not on:
+                # 寻找动作开始
+                if detect_high:
+                    condition_met = y[i] >= th_hi
+                else:
+                    condition_met = y[i] <= th_hi  # 注意：低谷检测时th_hi是低阈值
+                
+                if condition_met:
+                    on, s = True, i
+            else:
+                # 寻找动作结束
+                if detect_high:
+                    condition_met = y[i] < th_lo
+                else:
+                    condition_met = y[i] > th_lo  # 注意：低谷检测时th_lo是高阈值
+                
+                if condition_met:
+                    e = i
+                    segs.append((s, max(e, s+1)))
+                    on, s = False, None
         
-        results.append({
-            "index": i,
-            "start_time": round(float(start_time), 3),
-            "end_time": round(float(end_time), 3),
-            "duration": round(float(duration), 3)
-        })
-    
-    return results
+        if on and s is not None:
+            segs.append((s, n))
+        return segs
 
-# ===== 主分析函数 =====
-def analyze_improved_pout(t: np.ndarray, r: np.ndarray) -> dict:
-    """改进版嘟嘴分析算法"""
-    # 估算采样率
-    fs = _estimate_fs(t)
-    
-    # 信号预处理
-    processed_signal = _preprocess_signal(r, fs)
-    
-    # 计算自适应阈值
-    thresholds = _calculate_adaptive_thresholds(processed_signal)
-    
-    # 检测初步段落
-    raw_segments = _detect_pout_segments(processed_signal, thresholds)
-    
-    # 如果完全检测不到，放宽阈值再试一次
-    if len(raw_segments) == 0:
-        # 降低高阈值15%
-        relaxed_high = thresholds['baseline'] + 0.85 * (thresholds['high_threshold'] - thresholds['baseline'])
-        relaxed_low = thresholds['baseline'] + DetectionConfig.HYSTERESIS_RATIO * (relaxed_high - thresholds['baseline'])
-        relaxed_thresholds = {
-            'high_threshold': relaxed_high,
-            'low_threshold': relaxed_low,
-            'baseline': thresholds['baseline'],
-            'noise_std': thresholds['noise_std']
+    @staticmethod
+    def _pad_merge_cut(segs, fs, n, pad_sec, min_gap_sec, max_seg_sec):
+        """原始的段落后处理逻辑"""
+        if not segs: 
+            return []
+
+        pad = int(round(pad_sec * fs))
+        segs = [(max(0, s-pad), min(n, e+pad)) for (s, e) in segs]
+
+        # 第一阶段：自适应合并
+        merged = []
+        min_gap = int(round(min_gap_sec * fs))
+        for s, e in sorted(segs):
+            if not merged:
+                merged.append([s, e])
+                continue
+            ps, pe = merged[-1]
+            if s - pe <= min_gap:
+                merged[-1][1] = max(pe, e)
+            else:
+                merged.append([s, e])
+
+        # 第二阶段：强制合并（简化原始的while循环）
+        FIX_MIN_GAP_SEC = 0.3
+        fix_gap = int(round(FIX_MIN_GAP_SEC * fs))
+        final_merged = []
+        for s, e in merged:
+            if not final_merged:
+                final_merged.append([s, e])
+                continue
+            ps, pe = final_merged[-1]
+            if s - pe <= fix_gap:
+                final_merged[-1][1] = max(pe, e)
+            else:
+                final_merged.append([s, e])
+
+        # 第三阶段：长度限制
+        final = []
+        max_len = int(round(max_seg_sec * fs))
+        for s, e in final_merged:
+            L = e - s
+            if L <= max_len:
+                final.append((s, e))
+            else:
+                k = max(1, int(math.ceil(L / max_len)))
+                step = int(round(L / k))
+                cur = s
+                for _ in range(k-1):
+                    final.append((cur, cur+step))
+                    cur += step
+                final.append((cur, e))
+        return final
+
+    @staticmethod
+    def _build_segments(t: np.ndarray, idx_pairs):
+        """构建段落输出格式"""
+        n = len(t)
+        segs = []
+        for i, (s, e) in enumerate(idx_pairs):
+            st = float(t[s])
+            ed = float(t[e-1]) if e-1 < n else float(t[-1])
+            segs.append({
+                "index": i, 
+                "start_time": round(st, 3),
+                "end_time": round(ed, 3),
+                "duration": round(ed - st, 3)
+            })
+        return segs
+
+    @staticmethod
+    def auto_params_from_data(y_s: np.ndarray, detect_high=True):
+        """原始的自适应参数推导 + 双向支持"""
+        if detect_high:
+            # 嘟嘴：检测高平台（原始逻辑）
+            q40 = np.percentile(y_s, 40)
+            q75 = np.percentile(y_s, 75)
+            base_med = np.median(y_s[y_s <= q40]) if np.any(y_s <= q40) else float(np.median(y_s))
+            top_med = np.median(y_s[y_s >= q75]) if np.any(y_s >= q75) else float(np.median(y_s))
+            sigma = max(RobustDetector._mad_sigma(y_s), 1e-6)
+
+            sep = (top_med - base_med) / sigma if sigma > 0 else 0.0
+            # 根据分离度选择k_sigma
+            if   sep >= 5.0: k_sigma = 3.5
+            elif sep >= 3.0: k_sigma = 3.0
+            elif sep >= 1.8: k_sigma = 2.5
+            else:            k_sigma = 2.0
+
+            k_delta = 0.9
+            thr_hi = base_med + k_sigma * sigma
+            thr_lo = thr_hi - k_delta * sigma
+
+        else:
+            # 闭嘴唇：检测低谷（镜像逻辑）
+            q25 = np.percentile(y_s, 25)
+            q60 = np.percentile(y_s, 60)
+            base_med = np.median(y_s[y_s >= q60]) if np.any(y_s >= q60) else float(np.median(y_s))
+            bottom_med = np.median(y_s[y_s <= q25]) if np.any(y_s <= q25) else float(np.median(y_s))
+            sigma = max(RobustDetector._mad_sigma(y_s), 1e-6)
+
+            sep = (base_med - bottom_med) / sigma if sigma > 0 else 0.0
+            # 相同的分离度逻辑
+            if   sep >= 5.0: k_sigma = 3.5
+            elif sep >= 3.0: k_sigma = 3.0
+            elif sep >= 1.8: k_sigma = 2.5
+            else:            k_sigma = 2.0
+
+            k_delta = 0.9
+            thr_hi = base_med - k_sigma * sigma  # 向下的激活阈值
+            thr_lo = thr_hi + k_delta * sigma    # 向上的回滞阈值
+
+        return dict(
+            base_med=base_med, 
+            sigma=sigma,
+            k_sigma=k_sigma, 
+            k_delta=k_delta,
+            thr_hi=thr_hi, 
+            thr_lo=thr_lo
+        )
+
+    @staticmethod
+    def analyze_robust(t: np.ndarray, r: np.ndarray, detect_high=True, motion_name=""):
+        """原始robust算法主函数 + 双向支持"""
+        fs = RobustDetector._estimate_fs(t)
+        dt = 1.0/fs
+
+        # 原始的信号预处理参数
+        box_win_sec = 0.12
+        k = max(1, int(round(box_win_sec * fs)))
+        r_ma = RobustDetector._moving_average(r, k)
+
+        tau = 0.20  # 原始的时间常数
+        alpha = dt / (tau + dt)
+        r_s = RobustDetector._exp_smooth(r_ma, alpha)
+
+        # 自适应阈值计算
+        th = RobustDetector.auto_params_from_data(r_s, detect_high)
+        thr_hi, thr_lo = th["thr_hi"], th["thr_lo"]
+
+        # 第一次检测
+        raw = RobustDetector._hysteresis_segments(r_s, thr_hi, thr_lo, detect_high)
+
+        # 如果检测不到，放宽阈值（原始逻辑）
+        if len(raw) == 0:
+            if detect_high:
+                thr_hi2 = th["base_med"] + 0.85 * (thr_hi - th["base_med"])
+                thr_lo2 = thr_hi2 - th["k_delta"] * th["sigma"]
+            else:
+                thr_hi2 = th["base_med"] - 0.85 * (th["base_med"] - thr_hi)
+                thr_lo2 = thr_hi2 + th["k_delta"] * th["sigma"]
+            
+            raw = RobustDetector._hysteresis_segments(r_s, thr_hi2, thr_lo2, detect_high)
+            thr_hi, thr_lo = thr_hi2, thr_lo2
+
+        # 原始的自适应参数推导
+        if raw:
+            durs = np.array([(e-s)/fs for (s,e) in raw])
+            med_dur = float(np.median(durs))
+        else:
+            med_dur = 3.0
+
+        pad_sec = min(0.15, 0.12 * med_dur)
+        min_gap_sec = float(np.clip(0.30 * med_dur, 0.40, 1.00))
+        max_seg_sec = float(np.clip(1.70 * med_dur, 2.50, 6.00))
+
+        # 段落后处理
+        seg_idx = RobustDetector._pad_merge_cut(raw, fs, len(r_s),
+                                               pad_sec=pad_sec,
+                                               min_gap_sec=min_gap_sec,
+                                               max_seg_sec=max_seg_sec)
+        segments = RobustDetector._build_segments(t, seg_idx)
+
+        # 修正的计数逻辑：每个段落就是一次动作
+        action_count = len(segments)
+        total_time = sum(seg["duration"] for seg in segments)
+        breakpoints = [round(seg["end_time"], 2) for seg in segments]
+
+        direction = "高平台" if detect_high else "低谷"
+        print(f"Robust {motion_name}检测({direction}): {action_count}次, 总时长{total_time:.2f}s")
+
+        return {
+            "action_count": action_count,
+            "total_action_time": round(float(total_time), 3),
+            "breakpoints": breakpoints,
+            "segments": segments,
+            "debug": {
+                "fs_hz": round(float(fs), 3),
+                "thr_hi": round(float(thr_hi), 4),
+                "thr_lo": round(float(thr_lo), 4),
+                "pad_sec": round(pad_sec, 3),
+                "min_gap_sec": round(min_gap_sec, 3),
+                "max_seg_sec": round(max_seg_sec, 3),
+                "raw_segments": len(raw),
+                "final_segments": len(segments),
+            }
         }
-        raw_segments = _detect_pout_segments(processed_signal, relaxed_thresholds)
-        thresholds = relaxed_thresholds  # 更新用于输出的阈值
-    
-    # 段落后处理流程
-    # 1. 合并相近段落
-    merged_segments = _merge_close_segments(raw_segments, t, DetectionConfig.MAX_GAP_MERGE)
-    
-    # 2. 过滤短段落
-    filtered_segments = _filter_by_duration(merged_segments, t, DetectionConfig.MIN_POUT_DURATION)
-    
-    # 3. 添加边缘扩展
-    final_segments = _apply_padding(filtered_segments, len(processed_signal), fs, DetectionConfig.PADDING_SEC)
-    
-    # 转换为输出格式
-    segments = _segments_to_results(final_segments, t)
-    
-    # 计算指标
-    pout_count = len(segments)
-    total_hold_time = sum(seg["duration"] for seg in segments)
-    breakpoints = [round(seg["end_time"], 2) for seg in segments]
-    
-    # 添加调试信息（用于日志）
-    print(f"🔍 改进版检测结果: {pout_count}次嘟嘴, 总时长{total_hold_time:.2f}s")
-    print(f"📊 阈值: 高={thresholds['high_threshold']:.3f}, 低={thresholds['low_threshold']:.3f}")
-    print(f"🎯 原始段落: {len(raw_segments)}, 最终段落: {len(final_segments)}")
-    
-    return {
-        "motion": "poutLip",
-        "pout_count": pout_count,
-        "total_hold_time": round(float(total_hold_time), 3),
-        "breakpoints": breakpoints,
-        "segments": segments
-    }
+
+# ===== 动作识别器 =====
+class MotionDetector:
+    @staticmethod
+    def detect_motion_type(header_columns):
+        cols_lower = [col.strip().lower() for col in header_columns]
+        
+        if "height_width_ratio" in cols_lower:
+            return "poutLip"
+        elif "total_lip_area" in cols_lower:
+            return "closeLip"
+        else:
+            return "unknown"
+
+# ===== 动作分析器 =====
+class PoutLipAnalyzer:
+    @staticmethod
+    def analyze(timestamps, height_width_ratios):
+        result = RobustDetector.analyze_robust(
+            timestamps, height_width_ratios, 
+            detect_high=True, motion_name="嘟嘴"
+        )
+        return {
+            "motion": "poutLip",
+            "pout_count": result["action_count"],
+            "total_hold_time": result["total_action_time"],
+            "breakpoints": result["breakpoints"],
+            "segments": result["segments"],
+            "debug": result["debug"]
+        }
+
+class CloseLipAnalyzer:
+    @staticmethod
+    def analyze(timestamps, total_lip_areas):
+        result = RobustDetector.analyze_robust(
+            timestamps, total_lip_areas,
+            detect_high=False, motion_name="闭嘴唇"
+        )
+        return {
+            "motion": "closeLip", 
+            "close_count": result["action_count"],
+            "total_close_time": result["total_action_time"],
+            "breakpoints": result["breakpoints"],
+            "segments": result["segments"],
+            "debug": result["debug"]
+        }
+
+# ===== 数据处理工具 =====
+class DataProcessor:
+    @staticmethod
+    def validate_and_extract(df, motion_type):
+        lowmap = {c.strip().lower(): c for c in df.columns}
+        
+        if "time_seconds" not in lowmap:
+            raise ValueError("Missing time_seconds column")
+        
+        timestamps = pd.to_numeric(df[lowmap["time_seconds"]], errors="coerce").to_numpy()
+        
+        if motion_type == "poutLip":
+            if "height_width_ratio" not in lowmap:
+                raise ValueError("Missing height_width_ratio column for pout detection")
+            values = pd.to_numeric(df[lowmap["height_width_ratio"]], errors="coerce").to_numpy()
+        
+        elif motion_type == "closeLip":
+            if "total_lip_area" not in lowmap:
+                raise ValueError("Missing total_lip_area column for close lip detection")
+            values = pd.to_numeric(df[lowmap["total_lip_area"]], errors="coerce").to_numpy()
+        
+        else:
+            raise ValueError(f"Unsupported motion type: {motion_type}")
+        
+        # 清理无效数据
+        valid_mask = np.isfinite(timestamps) & np.isfinite(values)
+        timestamps = timestamps[valid_mask]
+        values = values[valid_mask]
+        
+        if len(timestamps) < 2:
+            raise ValueError("Insufficient valid data points")
+        
+        return timestamps, values
 
 # ===== FastAPI路由 =====
 @app.post("/")
@@ -249,83 +362,69 @@ async def ingest(req: Request):
             return JSONResponse({"message": "no lines", "receivedCount": 0}, status_code=400)
 
         header = lines[0]
-        cols_lower = [c.strip().lower() for c in header.split(",")]
+        header_columns = [col.strip() for col in header.split(",")]
+        
+        # 识别动作类型
+        motion_type = MotionDetector.detect_motion_type(header_columns)
+        
+        if motion_type == "unknown":
+            return JSONResponse({
+                "message": "ROBUST API OK",
+                "motion": "unknown",
+                "reason": "no supported motion columns found",
+                "supported_motions": ["poutLip (height_width_ratio)", "closeLip (total_lip_area)"],
+                "receivedCount": max(0, len(lines) - 1)
+            }, status_code=200)
 
-        # 检查是否是嘟嘴数据
-        if "height_width_ratio" in cols_lower:
-            try:
-                # 转换为DataFrame
-                reader = csv.DictReader(io.StringIO("\n".join(lines)))
-                df = pd.DataFrame(reader)
-
-                # 建立列名映射（容错大小写和空白）
-                lowmap = {c.strip().lower(): c for c in df.columns}
-                
-                if "time_seconds" not in lowmap or "height_width_ratio" not in lowmap:
-                    return JSONResponse({
-                        "message": "IMPROVED API OK", 
-                        "motion": "poutLip",
-                        "error": "missing required columns"
-                    }, status_code=400)
-
-                # 提取并清理数据
-                t = pd.to_numeric(df[lowmap["time_seconds"]], errors="coerce").to_numpy()
-                r = pd.to_numeric(df[lowmap["height_width_ratio"]], errors="coerce").to_numpy()
-                
-                # 过滤有效数据
-                valid_mask = np.isfinite(t) & np.isfinite(r)
-                t, r = t[valid_mask], r[valid_mask]
-
-                if len(t) < 2:
-                    return JSONResponse({
-                        "message": "IMPROVED API OK",
-                        "motion": "poutLip",
-                        "pout_count": 0,
-                        "total_hold_time": 0.0,
-                        "breakpoints": [],
-                        "segments": []
-                    }, status_code=200)
-
-                # 使用改进版算法分析
-                result_core = analyze_improved_pout(t, r)
-                result = {"message": "IMPROVED API OK", **result_core}
-
-                # 输出到Railway日志便于调试
-                print("✅ 改进版API结果:", result)
-                
-                return JSONResponse(result, status_code=200)
-                
-            except Exception as e:
-                print(f"❌ 嘟嘴分析错误: {str(e)}")
-                return JSONResponse({
-                    "message": "IMPROVED API ERROR",
-                    "motion": "poutLip",
-                    "error": str(e),
-                    "pout_count": 0,
-                    "total_hold_time": 0.0,
-                    "breakpoints": [],
-                    "segments": []
-                }, status_code=500)
-
-        # 非嘟嘴数据
-        return JSONResponse({
-            "message": "IMPROVED API OK",
-            "motion": "unknown",
-            "reason": "missing height_width_ratio in header",
-            "receivedCount": max(0, len(lines) - 1)
-        }, status_code=200)
+        try:
+            # 解析CSV数据
+            reader = csv.DictReader(io.StringIO("\n".join(lines)))
+            df = pd.DataFrame(reader)
+            
+            # 验证并提取数据
+            timestamps, values = DataProcessor.validate_and_extract(df, motion_type)
+            
+            # 根据动作类型调用相应分析器
+            if motion_type == "poutLip":
+                result_core = PoutLipAnalyzer.analyze(timestamps, values)
+            elif motion_type == "closeLip":
+                result_core = CloseLipAnalyzer.analyze(timestamps, values)
+            else:
+                raise ValueError(f"Motion type {motion_type} not implemented")
+            
+            result = {"message": "ROBUST API OK", **result_core}
+            
+            print(f"Robust检测API结果 [{motion_type}]:", result)
+            return JSONResponse(result, status_code=200)
+            
+        except Exception as e:
+            print(f"动作分析错误 [{motion_type}]: {str(e)}")
+            return JSONResponse({
+                "message": "ROBUST API ERROR",
+                "motion": motion_type,
+                "error": str(e),
+                **({"pout_count": 0, "total_hold_time": 0.0} if motion_type == "poutLip" 
+                   else {"close_count": 0, "total_close_time": 0.0} if motion_type == "closeLip"
+                   else {}),
+                "breakpoints": [],
+                "segments": []
+            }, status_code=500)
         
     except Exception as e:
-        print(f"❌ API总体错误: {str(e)}")
+        print(f"API总体错误: {str(e)}")
         return JSONResponse({
-            "message": "IMPROVED API ERROR",
+            "message": "ROBUST API ERROR",
             "error": str(e)
         }, status_code=500)
 
-# ===== 健康检查路由 =====
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "version": "improved_v1.0"}
+    return {
+        "status": "healthy", 
+        "version": "robust_dual_v1.0",
+        "algorithm": "original_robust_hysteresis_with_dual_direction",
+        "supported_motions": ["poutLip", "closeLip"]
+    }
 
 if __name__ == "__main__":
     import uvicorn
