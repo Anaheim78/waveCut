@@ -1,5 +1,5 @@
 # api/ingest.py
-# FastAPI 版（零手調自動分段）
+# FastAPI — 自動分段（robust 門檻 + 回滯 + 段落擴展），on-segments 計數
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import io, csv, math
@@ -8,7 +8,7 @@ import pandas as pd
 
 app = FastAPI()
 
-# --------- 核心工具（與你本地 pout_auto 相同邏輯，但不畫圖）---------
+# ---------------- 核心工具 ----------------
 def _mad_sigma(x: np.ndarray) -> float:
     med = np.median(x)
     mad = np.median(np.abs(x - med))
@@ -44,7 +44,7 @@ def _hysteresis_segments(y: np.ndarray, th_hi: float, th_lo: float):
         else:
             if y[i] < th_lo:
                 e = i
-                segs.append((s, max(e, s+1)))
+                segs.append((s, max(e, s + 1)))
                 on, s = False, None
     if on and s is not None:
         segs.append((s, n))
@@ -56,6 +56,7 @@ def _pad_merge_cut(segs, fs, n, pad_sec, min_gap_sec, max_seg_sec):
     pad = int(round(pad_sec * fs))
     segs = [(max(0, s - pad), min(n, e + pad)) for (s, e) in segs]
 
+    # merge small gaps
     merged = []
     min_gap = int(round(min_gap_sec * fs))
     for s, e in sorted(segs):
@@ -67,6 +68,7 @@ def _pad_merge_cut(segs, fs, n, pad_sec, min_gap_sec, max_seg_sec):
         else:
             merged.append([s, e])
 
+    # enforce max length
     out = []
     max_len = int(round(max_seg_sec * fs))
     for s, e in merged:
@@ -96,7 +98,7 @@ def _build_segments(t: np.ndarray, idx_pairs):
     return segs
 
 def _auto_params_from_data(y_s: np.ndarray):
-    # 低 40% 當 baseline，中位；高 25% 當目標平台，中位；MAD 估噪
+    # 低 40% = baseline 中位；高 25% = 目標平台中位；MAD 估噪聲
     q40 = np.percentile(y_s, 40)
     q75 = np.percentile(y_s, 75)
     base_med = np.median(y_s[y_s <= q40]) if np.any(y_s <= q40) else float(np.median(y_s))
@@ -109,10 +111,11 @@ def _auto_params_from_data(y_s: np.ndarray):
     elif sep >= 1.8: k_sigma = 2.5
     else:            k_sigma = 2.0
 
-    k_delta = 0.9  # 回滯量
+    k_delta = 0.9  # 回滯
     thr_hi = base_med + k_sigma * sigma
     thr_lo = thr_hi  - k_delta * sigma
-    return dict(base_med=base_med, sigma=sigma, k_delta=k_delta, thr_hi=thr_hi, thr_lo=thr_lo)
+    return dict(base_med=base_med, sigma=sigma, k_delta=k_delta,
+                thr_hi=thr_hi, thr_lo=thr_lo)
 
 def analyze_arrays(t: np.ndarray, r: np.ndarray):
     # 估 fs
@@ -132,10 +135,10 @@ def analyze_arrays(t: np.ndarray, r: np.ndarray):
     th = _auto_params_from_data(r_s)
     thr_hi, thr_lo = th["thr_hi"], th["thr_lo"]
 
-    # 第一次切段
+    # 第一次切段（on-segments = 高於門檻的維持段）
     raw = _hysteresis_segments(r_s, thr_hi, thr_lo)
 
-    # 如果抓不到，放寬一次
+    # 若抓不到，放寬一次（降低高門檻 15%）
     if len(raw) == 0:
         thr_hi2 = th["base_med"] + 0.85 * (thr_hi - th["base_med"])
         thr_lo2 = thr_hi2 - th["k_delta"] * th["sigma"]
@@ -158,14 +161,20 @@ def analyze_arrays(t: np.ndarray, r: np.ndarray):
                              max_seg_sec=max_seg_sec)
     segments = _build_segments(t, seg_idx)
 
-    # breakpoints：回傳每段結束時間（不含最後一段）
+    # 斷點：每段的結束時間（不含最後一段）
     breakpoints = [round(seg["end_time"], 2) for seg in segments[:-1]]
 
-    # 嘟嘴次數（扣頭 /2 進位）
-    pout_count = int(math.ceil(max(0, len(segments) - 1) / 2.0))
+    # ---- on-segments 計數/時間 ----
+    # 判斷是否把「頭段」當校正段丟掉：若第一段起點距整段起點 ≤ 1s
+    drop_head = False
+    if segments:
+        drop_head = (segments[0]["start_time"] - float(t[0])) <= 1.0
 
-    # 維持總時間：扣頭後奇數段(1,3,5,…)相加
-    total_hold = sum(seg["duration"] for idx, seg in enumerate(segments[1:], start=1) if idx % 2 == 1)
+    effective_segments = segments[1:] if drop_head else segments
+
+    # 嘟嘴次數 = 有效維持段數；維持總時間 = 有效維持段 durations 合計
+    pout_count = len(effective_segments)
+    total_hold = sum(seg["duration"] for seg in effective_segments)
 
     return {
         "motion": "poutLip",
@@ -175,7 +184,7 @@ def analyze_arrays(t: np.ndarray, r: np.ndarray):
         "segments": segments
     }
 
-# --------- API 入口 ---------
+# ---------------- API ----------------
 @app.post("/")
 async def ingest(req: Request):
     body = await req.json()
@@ -192,7 +201,7 @@ async def ingest(req: Request):
         reader = csv.DictReader(io.StringIO("\n".join(lines)))
         df = pd.DataFrame(reader)
 
-        # 容錯（大小寫/空白）
+        # 欄位容錯（大小寫/空白）
         lowmap = {c.strip().lower(): c for c in df.columns}
         if "time_seconds" not in lowmap or "height_width_ratio" not in lowmap:
             return JSONResponse({"message": "bad schema", "motion": "poutLip"}, status_code=400)
@@ -201,6 +210,7 @@ async def ingest(req: Request):
         r = pd.to_numeric(df[lowmap["height_width_ratio"]], errors="coerce").to_numpy()
         m = np.isfinite(t) & np.isfinite(r)
         t, r = t[m], r[m]
+
         if len(t) < 2:
             return JSONResponse({
                 "message": "APITEST OK",
@@ -212,11 +222,9 @@ async def ingest(req: Request):
             }, status_code=200)
 
         result_core = analyze_arrays(t, r)
-        result = {
-            "message": "APITEST OK",
-            **result_core
-        }
-        # 方便你在 Railway「Logs」看到
+        result = {"message": "APITEST OK", **result_core}
+
+        # 方便在 Railway Logs 看
         print("APITEST result", result)
         return JSONResponse(result, status_code=200)
 
