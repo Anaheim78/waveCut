@@ -81,10 +81,7 @@ class RobustDetector:
         if not segs: 
             return []
 
-        pad = int(round(pad_sec * fs))
-        segs = [(max(0, s-pad), min(n, e+pad)) for (s, e) in segs]
-
-        # 第一阶段：自适应合并
+        # 第一阶段：预合并（在padding前）
         merged = []
         min_gap = int(round(min_gap_sec * fs))
         for s, e in sorted(segs):
@@ -97,7 +94,7 @@ class RobustDetector:
             else:
                 merged.append([s, e])
 
-        # 第二阶段：强制合并（简化原始的while循环）
+        # 第二阶段：强制合并
         FIX_MIN_GAP_SEC = 0.3
         fix_gap = int(round(FIX_MIN_GAP_SEC * fs))
         final_merged = []
@@ -111,10 +108,14 @@ class RobustDetector:
             else:
                 final_merged.append([s, e])
 
-        # 第三阶段：长度限制
+        # 第三阶段：添加padding
+        pad = int(round(pad_sec * fs))
+        padded_segs = [(max(0, s-pad), min(n, e+pad)) for (s, e) in final_merged]
+
+        # 第四阶段：长度限制
         final = []
         max_len = int(round(max_seg_sec * fs))
-        for s, e in final_merged:
+        for s, e in padded_segs:
             L = e - s
             if L <= max_len:
                 final.append((s, e))
@@ -127,6 +128,26 @@ class RobustDetector:
                     cur += step
                 final.append((cur, e))
         return final
+
+    @staticmethod
+    def _final_time_merge(segments, timestamps, max_gap_sec=0.2):
+        """基于实际时间的最终合并"""
+        if len(segments) < 2:
+            return segments
+        
+        final_merged = []
+        current_start, current_end = segments[0]
+        
+        for start, end in segments[1:]:
+            gap_time = timestamps[start] - timestamps[current_end]
+            if gap_time <= max_gap_sec:
+                current_end = end  # 合并段落
+            else:
+                final_merged.append((current_start, current_end))
+                current_start, current_end = start, end
+        
+        final_merged.append((current_start, current_end))
+        return final_merged
 
     @staticmethod
     def _build_segments(t: np.ndarray, idx_pairs):
@@ -146,9 +167,9 @@ class RobustDetector:
 
     @staticmethod
     def auto_params_from_data(y_s: np.ndarray, detect_high=True):
-        """原始的自适应参数推导 + 双向支持"""
+        """原始的自适应参数推导 + 双向支持 + 提高敏感度"""
         if detect_high:
-            # 嘟嘴：检测高平台（原始逻辑）
+            # 嘟嘴：检测高平台（调整后的逻辑）
             q40 = np.percentile(y_s, 40)
             q75 = np.percentile(y_s, 75)
             base_med = np.median(y_s[y_s <= q40]) if np.any(y_s <= q40) else float(np.median(y_s))
@@ -156,18 +177,19 @@ class RobustDetector:
             sigma = max(RobustDetector._mad_sigma(y_s), 1e-6)
 
             sep = (top_med - base_med) / sigma if sigma > 0 else 0.0
-            # 根据分离度选择k_sigma
-            if   sep >= 5.0: k_sigma = 3.5
-            elif sep >= 3.0: k_sigma = 3.0
-            elif sep >= 1.8: k_sigma = 2.5
-            else:            k_sigma = 2.0
+            # 更敏感的k_sigma选择（降低所有档位）
+            if   sep >= 5.0: k_sigma = 3.2  # 原3.5 → 3.2
+            elif sep >= 3.0: k_sigma = 2.7  # 原3.0 → 2.7
+            elif sep >= 1.8: k_sigma = 2.2  # 原2.5 → 2.2
+            elif sep >= 1.2: k_sigma = 1.9  # 新增档位
+            else:            k_sigma = 1.7  # 原2.0 → 1.7
 
             k_delta = 0.9
             thr_hi = base_med + k_sigma * sigma
             thr_lo = thr_hi - k_delta * sigma
 
         else:
-            # 闭嘴唇：检测低谷（镜像逻辑）
+            # 闭嘴唇：检测低谷（镜像逻辑，同样提高敏感度）
             q25 = np.percentile(y_s, 25)
             q60 = np.percentile(y_s, 60)
             base_med = np.median(y_s[y_s >= q60]) if np.any(y_s >= q60) else float(np.median(y_s))
@@ -175,11 +197,12 @@ class RobustDetector:
             sigma = max(RobustDetector._mad_sigma(y_s), 1e-6)
 
             sep = (base_med - bottom_med) / sigma if sigma > 0 else 0.0
-            # 相同的分离度逻辑
-            if   sep >= 5.0: k_sigma = 3.5
-            elif sep >= 3.0: k_sigma = 3.0
-            elif sep >= 1.8: k_sigma = 2.5
-            else:            k_sigma = 2.0
+            # 同样更敏感的k_sigma
+            if   sep >= 5.0: k_sigma = 3.2
+            elif sep >= 3.0: k_sigma = 2.7
+            elif sep >= 1.8: k_sigma = 2.2
+            elif sep >= 1.2: k_sigma = 1.9
+            else:            k_sigma = 1.7
 
             k_delta = 0.9
             thr_hi = base_med - k_sigma * sigma  # 向下的激活阈值
@@ -244,7 +267,11 @@ class RobustDetector:
                                                pad_sec=pad_sec,
                                                min_gap_sec=min_gap_sec,
                                                max_seg_sec=max_seg_sec)
-        segments = RobustDetector._build_segments(t, seg_idx)
+        
+        # 方案A：基于时间的最终合并
+        final_idx = RobustDetector._final_time_merge(seg_idx, t, max_gap_sec=0.2)
+        
+        segments = RobustDetector._build_segments(t, final_idx)
 
         # 修正的计数逻辑：每个段落就是一次动作
         action_count = len(segments)
@@ -275,7 +302,11 @@ class RobustDetector:
 class MotionDetector:
     @staticmethod
     def detect_motion_type(header_columns):
-        cols_lower = [col.strip().lower() for col in header_columns]
+        # 防御性处理，确保所有元素都不是None
+        cols_lower = []
+        for col in header_columns:
+            if col is not None:
+                cols_lower.append(str(col).strip().lower())
         
         if "height_width_ratio" in cols_lower:
             return "poutLip"
@@ -321,7 +352,12 @@ class CloseLipAnalyzer:
 class DataProcessor:
     @staticmethod
     def validate_and_extract(df, motion_type):
-        lowmap = {c.strip().lower(): c for c in df.columns}
+        # 防御性处理列名，避免None值
+        lowmap = {}
+        for c in df.columns:
+            if c is not None:
+                clean_col = str(c).strip().lower()
+                lowmap[clean_col] = c
         
         if "time_seconds" not in lowmap:
             raise ValueError("Missing time_seconds column")
@@ -362,7 +398,11 @@ async def ingest(req: Request):
             return JSONResponse({"message": "no lines", "receivedCount": 0}, status_code=400)
 
         header = lines[0]
-        header_columns = [col.strip() for col in header.split(",")]
+        # 防御性处理header，分割后过滤空值
+        header_columns = []
+        for col in header.split(","):
+            if col is not None and str(col).strip():
+                header_columns.append(str(col).strip())
         
         # 识别动作类型
         motion_type = MotionDetector.detect_motion_type(header_columns)
