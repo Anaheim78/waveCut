@@ -335,42 +335,8 @@ class PoutLipAnalyzer:
 class CloseLipAnalyzer:
     @staticmethod
     def analyze(timestamps, total_lip_areas):
-        # ✳️ 只對「抿嘴（closeLip）」忽略前 5 秒
-        IGNORE_HEAD_SEC = 5.0
-        try:
-            mask = timestamps >= IGNORE_HEAD_SEC
-            ts2 = timestamps[mask]
-            vals2 = total_lip_areas[mask]
-        except Exception:
-            # 若意外不是 numpy array，保底轉換
-            ts2 = np.array(timestamps)
-            vals2 = np.array(total_lip_areas)
-            mask = ts2 >= IGNORE_HEAD_SEC
-            ts2 = ts2[mask]
-            vals2 = vals2[mask]
-
-        if ts2.size < 2:
-            # 剩餘資料太少，回傳 0 段（維持原介面欄位）
-            return {
-                "motion": "closeLip",
-                "close_count": 0,
-                "total_close_time": 0.0,
-                "breakpoints": [],
-                "segments": [],
-                "debug": {
-                    "fs_hz": 0.0,
-                    "thr_hi": 0.0,
-                    "thr_lo": 0.0,
-                    "pad_sec": 0.0,
-                    "min_gap_sec": 0.0,
-                    "max_seg_sec": 0.0,
-                    "raw_segments": 0,
-                    "final_segments": 0,
-                }
-            }
-
         result = RobustDetector.analyze_robust(
-            ts2, vals2,
+            timestamps, total_lip_areas,
             detect_high=False, motion_name="闭嘴唇"
         )
         return {
