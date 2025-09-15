@@ -20,6 +20,7 @@ class RobustDetector:
     @staticmethod
     def _estimate_fs(t: np.ndarray) -> float:
         """估算采样率"""
+        #列出全部相鄰間格的陣列，中位數
         if len(t) < 2: 
             return 20.0
         dt = float(np.median(np.diff(t)))
@@ -353,6 +354,7 @@ class DataProcessor:
     @staticmethod
     def validate_and_extract(df, motion_type):
         # 防御性处理列名，避免None值
+        # 存入column名稱
         lowmap = {}
         for c in df.columns:
             if c is not None:
@@ -364,6 +366,7 @@ class DataProcessor:
         
         timestamps = pd.to_numeric(df[lowmap["time_seconds"]], errors="coerce").to_numpy()
         
+        #存取個別動作的專用指標
         if motion_type == "poutLip":
             if "height_width_ratio" not in lowmap:
                 raise ValueError("Missing height_width_ratio column for pout detection")
@@ -422,6 +425,7 @@ async def ingest(req: Request):
             df = pd.DataFrame(reader)
             
             # 验证并提取数据
+            #DataProcessor處理工具，切出波形圖的時間與值
             timestamps, values = DataProcessor.validate_and_extract(df, motion_type)
             
             # 根据动作类型调用相应分析器
