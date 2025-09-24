@@ -3,11 +3,11 @@ import pandas as pd
 import io
 
 # 匯入五個子模組
-import count_tongue
-import count_puff_cheek
-import count_reduce_cheek
-import count_pout_lips
-import count_sip_lips
+from . import count_tongue
+from . import count_pout_lips
+from . import count_puff_cheek
+from . import count_reduce_cheek
+from . import count_sip_lips
 
 app = FastAPI()
 
