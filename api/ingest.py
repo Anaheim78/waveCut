@@ -1,22 +1,27 @@
+# api/ingest.py
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import json
 
-# 只綁 POUT_LIPS → count_pout_lips（兩檔可跑）
+# 既有模組
 from . import count_pout_lips
-from . import count_sip_lips 
+from . import count_sip_lips
+
+# 新增臉頰
+from . import count_puff_cheek  
 
 app = FastAPI()
 
 ANALYZERS = {
-    "POUT_LIPS": count_pout_lips,   # 之後要擴充再加其他模組
-    "SIP_LIPS": count_sip_lips,
+    "POUT_LIPS":   count_pout_lips,
+    "SIP_LIPS":    count_sip_lips,
+    "PUFF_CHEEK":  count_puff_cheek,   # 只做 shape 驗證
+    "REDUCE_CHEEK": count_puff_cheek,  # 共用同一支，但進去 run() 要分 mode
 }
 
 @app.post("/")
 async def ingest(req: Request):
     try:
-        # 讀原始 body（會被 Starlette 快取，下游還能再次 await req.json()）
         raw = await req.body()
         body = json.loads(raw)
 
@@ -28,10 +33,13 @@ async def ingest(req: Request):
             )
 
         analyzer = ANALYZERS[training_type]
-        # 把「同一個 Request」原封不動丟給子程式處理
-        result = await analyzer.run(req)
+        result = await analyzer.run(req, mode=training_type)  # ★ 加 mode 參數區分 PUFF / REDUCE
 
         return JSONResponse({"trainingType": training_type, "result": result}, status_code=200)
 
     except Exception as e:
         return JSONResponse({"message": "INGEST ERROR", "error": str(e)}, status_code=500)
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
