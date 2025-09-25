@@ -4,11 +4,13 @@ import json
 
 # 只綁 POUT_LIPS → count_pout_lips（兩檔可跑）
 from . import count_pout_lips
+from . import count_sip_lips 
 
 app = FastAPI()
 
 ANALYZERS = {
     "POUT_LIPS": count_pout_lips,   # 之後要擴充再加其他模組
+    "SIP_LIPS": count_sip_lips,
 }
 
 @app.post("/")
