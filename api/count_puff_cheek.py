@@ -160,8 +160,10 @@ async def run(req: Request) -> dict:
         breakpoints = [seg["end_time"] for seg in segments]
 
         # === 新增曲線輸出（time,value list） ===
-        curve = [{"t": round(float(tt), 3), "v": round(float(vv), 6)}
-                 for tt, vv in zip(t, s_d)]
+        # curve = [{"t": round(float(tt), 3), "v": round(float(vv), 6)}
+        #          for tt, vv in zip(t, s_d)]
+        curve = [{"t": float(tt), "v": float(vv)} for tt, vv in zip(t, s_d)]
+
 
         return {
             "status": "OK",
