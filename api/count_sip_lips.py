@@ -69,12 +69,12 @@ async def run(req: Request) -> dict:
         # 必要欄位檢查
         if "time_seconds" not in lowmap:
             return {"status": "ERROR", "error": "Missing time_seconds column"}
-        if "lip_area" not in lowmap:
-            return {"status": "ERROR", "error": "Missing lip_area column for pout detection"}
+        if "total_lip_area" not in lowmap:
+            return {"status": "ERROR", "error": "Missing total_lip_area column for pout detection"}
 
         # 讀資料 + 過濾 NaN
         t_raw = pd.to_numeric(df[lowmap["time_seconds"]], errors="coerce").to_numpy()
-        r_raw = pd.to_numeric(df[lowmap["lip_area"]], errors="coerce").to_numpy()
+        r_raw = pd.to_numeric(df[lowmap["total_lip_area"]], errors="coerce").to_numpy()
         m = np.isfinite(t_raw) & np.isfinite(r_raw)
         t, r = t_raw[m], r_raw[m]
 
