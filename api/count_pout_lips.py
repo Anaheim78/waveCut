@@ -5,7 +5,7 @@ import pandas as pd
 from scipy.signal import butter, filtfilt
 
 # ===== 參數（與你現有邏輯一致） =====
-FS = 30.0
+FS = 20.0
 CUTOFF = 0.8
 ORDER = 4
 
