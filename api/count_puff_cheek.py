@@ -162,7 +162,9 @@ async def run(req: Request) -> dict:
         # === 新增曲線輸出（time,value list） ===
         # curve = [{"t": round(float(tt), 3), "v": round(float(vv), 6)}
         #          for tt, vv in zip(t, s_d)]
-        curve = [{"t": float(tt), "v": float(vv)} for tt, vv in zip(t, s_d)]
+        # curve = [{"t": float(tt), "v": float(vv)} for tt, vv in zip(t, s_d)]
+        curve = [{"t": round(float(tt), 3), "v": float(format(vv, ".6f"))}
+         for tt, vv in zip(t, s_d)]
 
 
         return {
