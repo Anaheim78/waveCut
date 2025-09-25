@@ -163,7 +163,7 @@ async def run(req: Request) -> dict:
         # curve = [{"t": round(float(tt), 3), "v": round(float(vv), 6)}
         #          for tt, vv in zip(t, s_d)]
         # curve = [{"t": float(tt), "v": float(vv)} for tt, vv in zip(t, s_d)]
-        curve = [{"t": round(float(tt), 3), "v": float(format(vv, ".6f"))}
+        curve = [{"t": round(float(tt), 3), "v": f"{vv:.10f}"}
          for tt, vv in zip(t, s_d)]
 
 
