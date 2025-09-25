@@ -10,7 +10,7 @@ RIGHT_CHEEK_IDXS = [164,0,267,269,270,410,423,327,326,432,434,416,376,352,346,34
 
 # 濾波參數（與其他模組一致）
 FS = 20.0
-CUTOFF = 0.8
+CUTOFF = 0.5
 ORDER = 4
 
 # ===== 濾波 & 前處理 =====
@@ -159,12 +159,17 @@ async def run(req: Request) -> dict:
         total_action_time = round(sum(seg["duration"] for seg in positive_segments), 3)
         breakpoints = [seg["end_time"] for seg in segments]
 
+        # === 新增曲線輸出（time,value list） ===
+        curve = [{"t": round(float(tt), 3), "v": round(float(vv), 6)}
+                 for tt, vv in zip(t, s_d)]
+
         return {
             "status": "OK",
             "action_count": action_count,
             "total_action_time": total_action_time,
             "breakpoints": breakpoints,
             "segments": segments,
+            "curve": curve,   
             "debug": {
                 "fs_hz": FS,
                 "cutoff": CUTOFF,
